@@ -16,6 +16,19 @@ def create_cn_celeb(list_path, data_path='dataset/'):
             f_train.write(f'{sound_path}\t{label}\n')
     f_train.close()
 
+def create_cn_instrument(list_path, data_path='dataset/'):
+    f_train = open(list_path, 'w', encoding='utf-8')
+    data_dir = os.path.join(data_path, 'chinese_instruments/data/')
+    dirs = sorted(os.listdir(data_dir))
+    for _, d in enumerate(dirs):
+        label = d[1:]
+        for file in os.listdir(os.path.join(data_dir, d)):
+            if not file.endswith(".wav"):
+                continue
+            sound_path = os.path.join(data_dir, d, file).replace('\\', '/')
+            f_train.write(f'{sound_path}\t{label}\n')
+    f_train.close()
+
 
 # 制作CN-Celeb2数据集列表，如果是Windows，请跳过这个数据集
 # 下载分包1地址：https://openslr.trmal.net/resources/82/cn-celeb2_v2.tar.gzaa
@@ -38,5 +51,4 @@ def create_cn_celeb2(list_path, data_path='dataset/'):
 
 
 if __name__ == '__main__':
-    create_cn_celeb(list_path='dataset/train_list.txt', data_path='dataset')
-    create_cn_celeb2(list_path='dataset/train_list.txt', data_path='dataset')
+    create_cn_instrument(list_path='dataset/train_list.txt', data_path='dataset/divide_dataset/')

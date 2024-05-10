@@ -3,6 +3,7 @@ import os
 import platform
 import shutil
 import time
+import concurrent.futures
 from datetime import timedelta
 
 import numpy as np
@@ -37,6 +38,18 @@ from mvector.utils.scheduler import WarmupCosineSchedulerLR, MarginScheduler
 from mvector.utils.utils import dict_to_object, print_arguments
 
 logger = setup_logger(__name__)
+
+def work(test_dataset, data_list, id, save_dir):
+    result = []
+    for data_path in data_list:
+        feature, label = test_dataset.get_feature(data_path, id)
+        feature = feature.numpy()
+        label = int(label)
+        save_path = os.path.join(save_dir, str(label), f'{int(time.time() * 1000)}.npy').replace('\\', '/')
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        np.save(save_path, feature)
+        result.append(f'{save_path}\t{label}\n')
+    return result
 
 
 class MVectorTrainer(object):
@@ -142,13 +155,12 @@ class MVectorTrainer(object):
                                         batch_size=self.configs.dataset_conf.eval_conf.batch_size,
                                         num_workers=self.configs.dataset_conf.dataLoader.num_workers)
 
+
     # 提取特征保存文件
     def extract_features(self, save_dir='dataset/features'):
         self.audio_featurizer = AudioFeaturizer(feature_method=self.configs.preprocess_conf.feature_method,
                                                 method_args=self.configs.preprocess_conf.get('method_args', {}))
-        for i, data_list in enumerate([self.configs.dataset_conf.train_list,
-                                       self.configs.dataset_conf.enroll_list,
-                                       self.configs.dataset_conf.trials_list]):
+        for i, data_list in enumerate(['dataset/train_list.txt']):
             # 获取测试数据
             test_dataset = MVectorDataset(data_list_path=data_list,
                                           audio_featurizer=self.audio_featurizer,
@@ -159,14 +171,27 @@ class MVectorTrainer(object):
                                           mode='extract_feature')
             save_data_list = data_list.replace('.txt', '_features.txt')
             with open(save_data_list, 'w', encoding='utf-8') as f:
-                for i in tqdm(range(len(test_dataset))):
-                    feature, label = test_dataset[i]
-                    feature = feature.numpy()
-                    label = int(label)
-                    save_path = os.path.join(save_dir, str(label), f'{int(time.time() * 1000)}.npy').replace('\\', '/')
-                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                    np.save(save_path, feature)
-                    f.write(f'{save_path}\t{label}\n')
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+                id = 0
+                data_list = []
+                futures = []
+                for i in range(len(test_dataset)):
+                    data_path, spk_id = test_dataset.lines[i].replace('\n', '').split('\t')
+                    if id == 0:
+                        id = spk_id
+                    if spk_id != id and len(data_list) != 0:
+                        future = executor.submit(work, test_dataset, data_list.copy(), id, save_dir)
+                        futures.append(future)
+                        id = spk_id
+                        data_list = []
+                    data_list.append(data_path)
+                future = executor.submit(work, test_dataset, data_list.copy(), id, save_dir)
+                futures.append(future)
+                
+                for future in tqdm(concurrent.futures.as_completed(futures), total=220):
+                    pass
+
+
             logger.info(f'{data_list}列表中的数据已提取特征完成，新列表为：{save_data_list}')
 
     def __setup_model(self, input_size, is_train=False):
@@ -374,6 +399,23 @@ class MVectorTrainer(object):
                 shutil.rmtree(old_model_path)
         logger.info('已保存模型：{}'.format(model_path))
 
+    def __test_epoch(self, epoch_id, save_model_path, local_rank, writer, nranks=0):
+        accuracies = []
+        for batch_id, (features, label, input_len) in enumerate(self.trials_loader):
+            if nranks > 1:
+                features = features.to(local_rank)
+                label = label.to(local_rank).long()
+                label = label.data.cpu().numpy()
+            else:
+                features = features.to(self.device)
+                label = label.to(self.device).long()
+                label = label.data.cpu().numpy()
+            with torch.cuda.amp.autocast(enabled=self.configs.train_conf.enable_amp):
+                output = self.model(features).data.cpu().numpy()
+            acc = accuracy(output, label)
+            accuracies.append(acc)
+        logger.info(f'test sample accuracy: {sum(accuracies) / len(accuracies):.5f}')
+
     def __train_epoch(self, epoch_id, save_model_path, local_rank, writer, nranks=0):
         train_times, accuracies, loss_sum = [], [], []
         start = time.time()
@@ -451,6 +493,19 @@ class MVectorTrainer(object):
             self.scheduler.step()
             if self.margin_scheduler:
                 self.margin_scheduler.step()
+        accuracys = []
+        # 获取检验的乐器概率和标签
+        with torch.no_grad():
+            for batch_id, (audio_features, label, input_lens) in enumerate(
+                    tqdm(self.trials_loader, desc="验证乐器种类")):
+                if self.stop_eval: break
+                audio_features = audio_features.to(self.device)
+                label = label.to(self.device).long()
+                output = self.model(audio_features).data.cpu()
+                label = label.data.cpu()
+                accuracys.append(accuracy(output, label))
+        self.model.train()
+        logger.info(f'test sample accuracy: {sum(accuracys) / len(accuracys):.5f}')
 
     def train(self,
               save_model_path='models/',
@@ -505,6 +560,7 @@ class MVectorTrainer(object):
         self.train_step = max(last_epoch, 0) * len(self.train_loader)
         # 开始训练
         for epoch_id in range(last_epoch, self.configs.train_conf.max_epoch):
+            logger.info('====start one epoch====\n\n')
             if self.stop_train: break
             epoch_id += 1
             start_epoch = time.time()
@@ -534,6 +590,53 @@ class MVectorTrainer(object):
                 # 保存模型
                 self.__save_checkpoint(save_model_path=save_model_path, epoch_id=epoch_id, eer=self.eval_eer,
                                        min_dcf=self.eval_min_dcf, threshold=self.eval_threshold)
+                self.__save_checkpoint(save_model_path=save_model_path, epoch_id=epoch_id, eer=self.eval_eer,
+                                        min_dcf=self.eval_min_dcf, threshold=self.eval_threshold, best_model=True)
+            logger.info('====finish one epoch====\n\n')
+
+    def test(self, resume_model=None, save_image_path=None):
+        """
+        评估模型
+        :param resume_model: 所使用的模型
+        :param save_image_path: 保存图片的路径
+        :return: 评估结果
+        """
+        if self.enroll_loader is None or self.trials_loader is None:
+            self.__setup_dataloader()
+        if self.model is None:
+            self.__setup_model(input_size=self.audio_featurizer.feature_dim)
+        if resume_model is not None:
+            if os.path.isdir(resume_model):
+                resume_model = os.path.join(resume_model, 'model.pth')
+            assert os.path.exists(resume_model), f"{resume_model} 模型不存在！"
+            if torch.cuda.is_available() and self.use_gpu:
+                model_state_dict = torch.load(resume_model)
+            else:
+                model_state_dict = torch.load(resume_model, map_location='cpu')
+            # 删除最后的分类层参数
+            if self.model_output_name in model_state_dict.keys():
+                del model_state_dict[self.model_output_name]
+            self.model.load_state_dict(model_state_dict, strict=True)
+            logger.info(f'成功加载模型：{resume_model}')
+        self.model.eval()
+        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+            eval_model = self.model.module if len(self.model.module) == 1 else self.model.module[0]
+        else:
+            eval_model = self.model if len(self.model) == 1 else self.model[0]
+
+        accuracys = []
+        # 获取检验的乐器概率和标签
+        with torch.no_grad():
+            for batch_id, (audio_features, label, input_lens) in enumerate(
+                    tqdm(self.trials_loader, desc="验证乐器种类")):
+                if self.stop_eval: break
+                audio_features = audio_features.to(self.device)
+                label = label.to(self.device).long()
+                output = eval_model(audio_features).data.cpu()
+                label = label.data.cpu()
+                accuracys.append(accuracy(output, label))
+        self.model.train()
+        logger.info(f'test sample accuracy: {sum(accuracys) / len(accuracys):.5f}')
 
     def evaluate(self, resume_model=None, save_image_path=None):
         """

@@ -60,6 +60,45 @@ class MVectorDataset(Dataset):
         with open(data_list_path, 'r', encoding='utf-8') as f:
             self.lines = f.readlines()
 
+    def get_feature(self, data_path, spk_id):
+        spk_id = int(spk_id)
+        # 如果后缀名为.npy的文件，那么直接读取
+        if data_path.endswith('.npy'):
+            feature = np.load(data_path)
+            if feature.shape[0] > self.max_feature_len:
+                crop_start = random.randint(0, feature.shape[0] - self.max_feature_len) if self.mode == 'eval' else 0
+                feature = feature[crop_start:crop_start + self.max_feature_len, :]
+            feature = torch.tensor(feature, dtype=torch.float32)
+        else:
+            # 读取音频
+            audio_segment = AudioSegment.from_file(data_path)
+            # 裁剪静音
+            if self.do_vad:
+                audio_segment.vad()
+            # 数据太短不利于训练
+            if self.mode == 'train':
+                if audio_segment.duration < self.min_duration:
+                    return self.__getitem__(0)
+            # 重采样
+            if audio_segment.sample_rate != self._target_sample_rate:
+                audio_segment.resample(self._target_sample_rate)
+            # 音频增强
+            if self.mode == 'train':
+                audio_segment, spk_id = self.augment_audio(audio_segment, spk_id, **self.aug_conf)
+            # decibel normalization
+            if self._use_dB_normalization:
+                audio_segment.normalize(target_db=self._target_dB)
+            # 裁剪需要的数据
+            if self.mode != 'extract_feature' and audio_segment.duration > self.max_duration:
+                audio_segment.crop(duration=self.max_duration, mode=self.mode)
+            samples = torch.tensor(audio_segment.samples, dtype=torch.float32)
+            feature = self.audio_featurizer(samples)
+            feature = feature.squeeze(0)
+        spk_id = torch.tensor(spk_id, dtype=torch.int64)
+        return feature, spk_id
+
+
+
     def __getitem__(self, idx):
         # 分割数据文件路径和标签
         data_path, spk_id = self.lines[idx].replace('\n', '').split('\t')
